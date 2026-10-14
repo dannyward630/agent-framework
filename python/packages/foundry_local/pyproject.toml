@@ -25,7 +25,8 @@ classifiers = [
 dependencies = [
     "agent-framework-core>=1.13.0,<2",
     "agent-framework-openai>=1.6.0,<2",
-    "foundry-local-sdk>=0.5.1,<0.5.2",
+    "foundry-local-sdk>=0.5.1,<0.5.2; python_version < '3.11'",
+    "foundry-local-sdk>=1.2.4,<3; python_version >= '3.11'",
 ]
 
 [tool.uv]

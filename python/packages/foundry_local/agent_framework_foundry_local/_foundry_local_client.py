@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from importlib import import_module
 from typing import Any, ClassVar, Generic, Literal, cast, overload
 
 from agent_framework import (
@@ -22,12 +23,34 @@ from agent_framework import (
 from agent_framework._settings import load_settings
 from agent_framework.observability import ChatTelemetryLayer
 from agent_framework_openai._chat_completion_client import RawOpenAIChatCompletionClient
-from foundry_local import FoundryLocalManager
-from foundry_local.models import DeviceType, FoundryModelInfo
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from ._feature_usage import FeatureIndex
+
+FoundryLocalManager: Any
+_FoundryLocalConfiguration: Any
+_LegacyDeviceType: Any
+_use_modern_foundry_local_sdk: bool
+
+try:
+    from foundry_local_sdk import Configuration as _ModernFoundryLocalConfiguration
+    from foundry_local_sdk import FoundryLocalManager as _ModernFoundryLocalManager
+
+    FoundryLocalManager = cast(Any, _ModernFoundryLocalManager)
+    _FoundryLocalConfiguration = cast(Any, _ModernFoundryLocalConfiguration)
+    _LegacyDeviceType = None
+    _use_modern_foundry_local_sdk = True
+except ModuleNotFoundError as exc:
+    if exc.name != "foundry_local_sdk":
+        raise
+
+    _legacy_sdk = import_module("foundry_local")
+    _legacy_models = import_module("foundry_local.models")
+    FoundryLocalManager = _legacy_sdk.FoundryLocalManager
+    _LegacyDeviceType = _legacy_models.DeviceType
+    _FoundryLocalConfiguration = None
+    _use_modern_foundry_local_sdk = False
 
 if sys.version_info >= (3, 13):
     from typing import TypeVar  # pragma: no cover
@@ -115,6 +138,83 @@ FoundryLocalChatOptionsT = TypeVar(
 
 
 # endregion
+
+
+def _device_name(device: Any) -> str:
+    """Return a normalized device name from a string or SDK enum."""
+    value = getattr(device, "value", None)
+    if value is None:
+        value = getattr(device, "name", device)
+    return str(value).casefold()
+
+
+def _resolve_modern_model(manager: Any, model_identifier: str, device: Any | None = None) -> Any | None:
+    """Resolve a model by alias or variant ID using the current SDK catalog API."""
+    catalog = manager.catalog
+    model = catalog.get_model(model_identifier)
+    is_variant_id = model is None
+    if model is None:
+        model = catalog.get_model_variant(model_identifier)
+    if model is None or device is None:
+        return model
+
+    requested_device = _device_name(device)
+    if requested_device == "auto":
+        return model
+
+    device_markers = {
+        "gpu": ("gpu", "cuda", "webgpu", "winml", "directml"),
+        "cpu": ("cpu",),
+    }.get(requested_device, (requested_device,))
+    matching_variant = next(
+        (
+            variant
+            for variant in model.variants
+            if any(marker in str(getattr(variant, "id", "")).casefold() for marker in device_markers)
+        ),
+        None,
+    )
+    if matching_variant is None:
+        raise ValueError(
+            f"Model with ID or alias '{model_identifier}:{_device_name(device).upper()}' not found in Foundry Local."
+        )
+
+    if is_variant_id:
+        return model
+
+    model.select_variant(matching_variant)
+    return model
+
+
+class _FoundryLocalManagerCompatibility:
+    """Expose the previous manager convenience methods over the modern SDK."""
+
+    def __init__(self, manager: Any, base_url: str, api_key: str) -> None:
+        self._manager = manager
+        self.endpoint = base_url
+        self.api_key = api_key
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
+
+    def list_catalog_models(self) -> list[Any]:
+        """Return models from the current SDK catalog."""
+        return self._manager.catalog.list_models()
+
+    def get_model_info(self, model: str, device: Any | None = None) -> Any:
+        """Resolve a model by alias or ID, optionally selecting a device variant."""
+        model_info = _resolve_modern_model(self._manager, model, device)
+        if model_info is None:
+            raise ValueError(f"Model with ID or alias '{model}' not found in Foundry Local.")
+        return model_info
+
+    def download_model(self, model: str, device: Any | None = None) -> None:
+        """Download a model through the current SDK model API."""
+        self.get_model_info(model, device).download()
+
+    def load_model(self, model: str, device: Any | None = None) -> None:
+        """Load a model through the current SDK model API."""
+        self.get_model_info(model, device).load()
 
 
 class FoundryLocalSettings(TypedDict, total=False):
@@ -222,7 +322,7 @@ class FoundryLocalClient(
         bootstrap: bool = True,
         timeout: float | None = None,
         prepare_model: bool = True,
-        device: DeviceType | None = None,
+        device: Any | None = None,
         additional_properties: dict[str, Any] | None = None,
         middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
         function_invocation_configuration: FunctionInvocationConfiguration | None = None,
@@ -234,18 +334,19 @@ class FoundryLocalClient(
         Keyword Args:
             model: The Foundry Local model ID or alias to use. If not provided,
                 it will be loaded from the FoundryLocalSettings.
-            bootstrap: Whether to start the Foundry Local service if not already running.
-                Default is True.
+            bootstrap: Whether to initialize the Foundry Local SDK when needed. Default is True.
+                With the modern SDK, ``bootstrap=False`` requires an already initialized
+                ``FoundryLocalManager``; the embedded HTTP endpoint is started for the client.
             timeout: Optional timeout for requests to Foundry Local.
-                This timeout is applied to any call to the Foundry Local service.
+                This timeout is applied to requests sent through the OpenAI-compatible API.
             prepare_model: Whether to download the model into the cache, and load the model into
                 the inferencing service upon initialization. Default is True.
-                If false, the first call to generate a completion will load the model,
-                and might take a long time.
+                If false, make sure the model is available before the first request. Depending
+                on the installed SDK, the first request may load the model and take longer.
             device: The device type to use for model inference.
-                The device is used to select the appropriate model variant.
-                If not provided, the default device for your system will be used.
-                The values are in the foundry_local.models.DeviceType enum.
+                The device selects the appropriate model variant. A legacy ``DeviceType``
+                value or a device name such as ``"cpu"`` or ``"gpu"`` may be used.
+                If omitted, Foundry Local chooses.
             additional_properties: Additional properties stored on the client instance.
             middleware: Optional sequence of ChatAndFunctionMiddlewareTypes to apply to requests.
             function_invocation_configuration: Optional configuration for function invocation support.
@@ -272,18 +373,15 @@ class FoundryLocalClient(
                 os.environ["FOUNDRY_LOCAL_MODEL"] = "phi-4-mini"
                 client = FoundryLocalClient()
 
-                # A FoundryLocalManager is created and if set, the service is started.
                 # The FoundryLocalManager is available via the `manager` property.
-                # For instance to find out which models are available:
+                # For instance, to find out which models are available:
                 for model in client.manager.list_catalog_models():
-                    print(f"- {model.alias} for {model.task} - id={model.id}")
+                    print(f"- {model.alias} - id={model.id}")
 
                 # Other options include specifying the device type:
-                from foundry_local.models import DeviceType
-
                 client = FoundryLocalClient(
                     model="phi-4-mini",
-                    device=DeviceType.GPU,
+                    device="gpu",
                 )
                 # and choosing if the model should be prepared on initialization:
                 client = FoundryLocalClient(
@@ -294,8 +392,8 @@ class FoundryLocalClient(
                 # will take a long time as the model is loaded then.
                 # Alternatively, you could call the `download_model` and `load_model` methods
                 # on the `manager` property manually.
-                client.manager.download_model("phi-4-mini", device=DeviceType.CPU)
-                client.manager.load_model("phi-4-mini", device=DeviceType.CPU)
+                client.manager.download_model("phi-4-mini", device="cpu")
+                client.manager.load_model("phi-4-mini", device="cpu")
 
                 # You can also use the CLI:
                 `foundry model load phi-4-mini --device Auto`
@@ -311,7 +409,7 @@ class FoundryLocalClient(
                 response = await client.get_response("Hello", options={"my_custom_option": "value"})
 
         Raises:
-            ValueError: If the specified model ID or alias is not found.
+            ValueError: If the specified model ID, alias, or device variant is not found.
                 Sometimes a model might be available but if you have specified a device
                 type that is not supported by the model, it will not be found.
 
@@ -326,27 +424,77 @@ class FoundryLocalClient(
         )
         model_setting: str = settings["model"]  # type: ignore[assignment]
 
-        manager = FoundryLocalManager(bootstrap=bootstrap, timeout=timeout)
-        model_info: FoundryModelInfo | None = manager.get_model_info(
-            model_setting,
-            device=device,
-        )
-        if model_info is None:
-            message = (
-                f"Model with ID or alias '{model_setting}:{device.value}' not found in Foundry Local."
-                if device
-                else (f"Model with ID or alias '{model_setting}' for your current device not found in Foundry Local.")
-            )
-            raise ValueError(message)
-        if prepare_model:
-            manager.download_model(model_info.id, device=device)
-            manager.load_model(model_info.id, device=device)
+        if _use_modern_foundry_local_sdk:
+            manager = FoundryLocalManager.instance
+            if manager is None:
+                if not bootstrap:
+                    raise ValueError(
+                        "bootstrap=False requires FoundryLocalManager to be initialized before creating the client."
+                    )
+                if _FoundryLocalConfiguration is None:
+                    raise RuntimeError("The installed Foundry Local SDK does not provide Configuration.")
+                FoundryLocalManager.initialize(_FoundryLocalConfiguration(app_name="agent-framework"))
+                manager = FoundryLocalManager.instance
+            if manager is None:
+                raise RuntimeError("Foundry Local SDK initialization did not create a manager instance.")
+
+            model_info = _resolve_modern_model(manager, model_setting, device)
+            if model_info is None:
+                requested_model = model_setting
+                if device is not None:
+                    requested_model += f":{_device_name(device).upper()}"
+                message = f"Model with ID or alias '{requested_model}' not found in Foundry Local."
+                raise ValueError(message)
+            if prepare_model:
+                model_info.download()
+                model_info.load()
+
+            if not manager.urls:
+                manager.start_web_service()
+            if not manager.urls:
+                raise RuntimeError("Foundry Local web service did not provide an endpoint.")
+
+            base_url = f"{manager.urls[0].rstrip('/')}/v1"
+            api_key = "local"
+            async_client_kwargs: dict[str, Any] = {"base_url": base_url, "api_key": api_key}
+            if timeout is not None:
+                async_client_kwargs["timeout"] = timeout
+            async_client = AsyncOpenAI(**async_client_kwargs)
+            manager_compatibility = _FoundryLocalManagerCompatibility(manager, base_url, api_key)
+        else:
+            manager = FoundryLocalManager(bootstrap=bootstrap, timeout=timeout)
+            legacy_device = device
+            if isinstance(device, str) and _LegacyDeviceType is not None:
+                try:
+                    legacy_device = _LegacyDeviceType[device.upper()]
+                except KeyError:
+                    legacy_device = _LegacyDeviceType(device)
+            model_info = manager.get_model_info(model_setting, device=legacy_device)
+            if model_info is None:
+                if device is not None:
+                    message = (
+                        f"Model with ID or alias '{model_setting}:{_device_name(device).upper()}' "
+                        "not found in Foundry Local."
+                    )
+                else:
+                    message = (
+                        f"Model with ID or alias '{model_setting}' for your current device not found in Foundry Local."
+                    )
+                raise ValueError(message)
+            if prepare_model:
+                manager.download_model(model_info.id, device=legacy_device)
+                manager.load_model(model_info.id, device=legacy_device)
+            async_client_kwargs: dict[str, Any] = {"base_url": manager.endpoint, "api_key": manager.api_key}
+            if timeout is not None:
+                async_client_kwargs["timeout"] = timeout
+            async_client = AsyncOpenAI(**async_client_kwargs)
+            manager_compatibility = manager
 
         super().__init__(
             model=model_info.id,
-            async_client=AsyncOpenAI(base_url=manager.endpoint, api_key=manager.api_key),
+            async_client=async_client,
             additional_properties=additional_properties,
             middleware=middleware,
             function_invocation_configuration=function_invocation_configuration,
         )
-        self.manager = manager
+        self.manager = manager_compatibility

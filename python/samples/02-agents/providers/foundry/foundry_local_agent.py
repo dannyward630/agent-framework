@@ -62,9 +62,7 @@ async def main() -> None:
     print("Other available models (tool calling supported only):")
     for model in client.manager.list_catalog_models():
         if model.supports_tool_calling:
-            print(
-                f"- {model.alias} for {model.task} - id={model.id} - {(model.file_size_mb / 1000):.2f} GB - {model.license}"
-            )
+            print(f"- {model.alias} - id={model.id}")
     agent = Agent(
         client=client,
         name="LocalAgent",
